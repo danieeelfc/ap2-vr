@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apartamento em VR (bake)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1a1a; }
+  #msg { position: fixed; top: 16px; left: 16px; max-width: calc(100% - 56px); padding: 6px 12px; border-radius: 6px;
+         background: rgb(0 0 0 / .6); color: #eee; font: 15px/1.4 system-ui, sans-serif; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="msg">Carregando…</div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+// Porta de entrada, a câmera "R104 | from entry" (Blender 3.32, 0.55 → glTF x, -y).
+// Olhando para -Z, que é o +Y do Blender, para dentro do apartamento.
+const SPAWN = new THREE.Vector3(3.32, 0, -0.55);
+const UP = new THREE.Vector3(0, 1, 0);
+const msg = document.getElementById('msg');
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.xr.enabled = true;
+document.body.append(renderer.domElement, VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xdfe6ea);
+// cozinha e jantar vêm com a luz gravada (sem luz em tempo real); o resto do apartamento usa estas
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment()).texture;
+scene.add(new THREE.HemisphereLight(0xffffff, 0xf3ead8, 1.2));   // o teto recebe a luz "do chão"
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100);
+const dolly = new THREE.Group();          // mover o dolly = teleporte; a cabeça é do headset
+dolly.add(camera);
+scene.add(dolly);
+camera.position.set(SPAWN.x, 1.6, SPAWN.z);
+
+const controls = new OrbitControls(camera, renderer.domElement);   // prévia no computador
+controls.target.set(SPAWN.x, 1.6, SPAWN.z - 1);
+controls.update();
+
+new GLTFLoader().setMeshoptDecoder(MeshoptDecoder).load('apartamento.glb', gltf => {
+  gltf.scene.traverse(o => {
+    // transmission custa uma passada extra por olho no Quest; vidro vira transparência simples
+    if (o.material?.transmission > 0) Object.assign(o.material, { transmission: 0, transparent: true, opacity: 0.25, depthWrite: false });
+    // o bake já sai com o AgX da cena; sem isso o tone mapping do navegador passaria por cima
+    if (o.material?.isMeshBasicMaterial) o.material.toneMapped = false;
+  });
+  scene.add(gltf.scene);
+  msg.textContent = 'No Quest: Enter VR. Gatilho segurado aponta, soltar teleporta. Analógico direito gira.';
+}, e => { if (e.total) msg.textContent = `Carregando… ${Math.round(e.loaded / e.total * 100)}%`; },
+   e => { msg.textContent = 'Erro ao carregar o modelo: ' + e.message; });
+
+// Teleporte: segurar o gatilho mira no piso (plano z=0 do Blender), soltar leva a cabeça até lá.
+// ponytail: mira no plano do piso, atravessa parede e móvel; raycast no modelo se incomodar
+const floor = new THREE.Plane(UP, 0);
+const ray = new THREE.Ray();
+const aim = new THREE.Vector3();
+const head = new THREE.Vector3();
+const marker = new THREE.Mesh(new THREE.RingGeometry(0.15, 0.2, 32).rotateX(-Math.PI / 2),
+                              new THREE.MeshBasicMaterial({ color: 0x2f9e5b }));
+marker.visible = false;
+scene.add(marker);
+
+const factory = new XRControllerModelFactory();
+const controllers = [0, 1].map(i => {
+  const c = renderer.xr.getController(i);
+  const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -8)]),
+                              new THREE.LineBasicMaterial({ color: 0xffffff }));
+  line.visible = false;
+  c.add(line);
+  c.addEventListener('selectstart', () => { c.userData.aiming = true; line.visible = true; });
+  c.addEventListener('selectend', () => {
+    c.userData.aiming = line.visible = false;
+    if (!marker.visible) return;
+    camera.getWorldPosition(head);
+    dolly.position.x += marker.position.x - head.x;
+    dolly.position.z += marker.position.z - head.z;
+    marker.visible = false;
+  });
+  const grip = renderer.xr.getControllerGrip(i);
+  grip.add(factory.createControllerModel(grip));
+  dolly.add(c, grip);
+  return c;
+});
+
+let turnReady = true;
+function snapTurn() {
+  for (const src of renderer.xr.getSession()?.inputSources ?? []) {
+    if (src.handedness !== 'right' || !src.gamepad) continue;
+    const x = src.gamepad.axes[2] ?? 0;
+    if (Math.abs(x) < 0.3) turnReady = true;
+    if (!turnReady || Math.abs(x) < 0.7) continue;
+    turnReady = false;
+    const a = -Math.sign(x) * Math.PI / 6;   // 30° por toque, girando em volta da cabeça
+    camera.getWorldPosition(head);
+    dolly.position.sub(head).applyAxisAngle(UP, a).add(head);
+    dolly.rotateY(a);
+  }
+}
+
+renderer.xr.addEventListener('sessionstart', () => {
+  controls.enabled = false;
+  dolly.position.copy(SPAWN);
+  dolly.rotation.set(0, 0, 0);
+});
+
+renderer.setAnimationLoop(() => {
+  if (renderer.xr.isPresenting) {
+    snapTurn();
+    const c = controllers.find(c => c.userData.aiming);
+    marker.visible = false;
+    if (c) {
+      ray.origin.setFromMatrixPosition(c.matrixWorld);
+      ray.direction.set(0, 0, -1).transformDirection(c.matrixWorld);
+      if (ray.intersectPlane(floor, aim)) { marker.position.copy(aim).setY(0.01); marker.visible = true; }
+    }
+  }
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
